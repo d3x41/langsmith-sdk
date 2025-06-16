@@ -3359,6 +3359,13 @@ console-table-printer@^2.12.1:
   dependencies:
     simple-wcswidth "^1.0.1"
 
+console-table-printer@^2.13.0:
+  version "2.14.3"
+  resolved "https://registry.yarnpkg.com/console-table-printer/-/console-table-printer-2.14.3.tgz#d679794a3dead5ba739517d52d90dedea426ed07"
+  integrity sha512-X5OCFnjYlXzRuC8ac5hPA2QflRjJvNKJocMhlnqK/Ap7q3DHXr0NJ0TGzwmEKOiOdJrjsSwEd0m+a32JAYPrKQ==
+  dependencies:
+    simple-wcswidth "^1.0.1"
+
 convert-source-map@^2.0.0:
   version "2.0.0"
   resolved "https://registry.yarnpkg.com/convert-source-map/-/convert-source-map-2.0.0.tgz#4b560f649fc4e918dd0ab75cf4961e8bc882d82a"
