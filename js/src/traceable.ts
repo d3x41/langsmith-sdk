@@ -19,7 +19,10 @@ import {
   AsyncLocalStorageProviderSingleton,
 } from "./singletons/traceable.js";
 import { _LC_CONTEXT_VARIABLES_KEY } from "./singletons/constants.js";
-import { TraceableFunction } from "./singletons/types.js";
+import type {
+  TraceableFunction,
+  ContextPlaceholder,
+} from "./singletons/types.js";
 import {
   isKVMap,
   isReadableStream,
@@ -29,10 +32,55 @@ import {
   isGenerator,
   isPromiseMethod,
 } from "./utils/asserts.js";
+import { getEnvironmentVariable } from "./utils/env.js";
+import { __version__ } from "./index.js";
+import { getOTELTrace, getOTELContext } from "./singletons/otel.js";
+import { createOtelSpanContextFromRun } from "./experimental/otel/utils.js";
+import { OTELTracer } from "./experimental/otel/types.js";
 
 AsyncLocalStorageProviderSingleton.initializeGlobalInstance(
-  new AsyncLocalStorage<RunTree | undefined>()
+  new AsyncLocalStorage<RunTree | ContextPlaceholder | undefined>()
 );
+
+/**
+ * Create OpenTelemetry context manager from RunTree if OTEL is enabled.
+ */
+function maybeCreateOtelContext<T>(
+  runTree?: RunTree,
+  tracer?: OTELTracer
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+): ((fn: (...args: any[]) => T) => T) | undefined {
+  if (!runTree || getEnvironmentVariable("OTEL_ENABLED") !== "true") {
+    return;
+  }
+
+  const otel_trace = getOTELTrace();
+  const otel_context = getOTELContext();
+
+  try {
+    const spanContext = createOtelSpanContextFromRun(runTree);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (fn: (...args: any[]) => T) => {
+      const resolvedTracer =
+        tracer ?? otel_trace.getTracer("langsmith", __version__);
+      return resolvedTracer.startActiveSpan(
+        runTree.name,
+        {
+          attributes: {
+            "langsmith.traceable": "true",
+          },
+        },
+        () => {
+          otel_trace.setSpanContext(otel_context.active(), spanContext);
+          return fn();
+        }
+      );
+    };
+  } catch {
+    // Silent failure if OTEL setup is incomplete
+    return;
+  }
+}
 
 const runInputsToMap = (rawInputs: unknown[]) => {
   const firstInput = rawInputs[0];
@@ -170,9 +218,9 @@ const getTracingRunTree = <Args extends unknown[]>(
   extractAttachments:
     | ((...args: Args) => [Attachments | undefined, KVMap])
     | undefined
-): RunTree | undefined => {
+): RunTree | ContextPlaceholder => {
   if (!isTracingEnabled(runTree.tracingEnabled)) {
-    return undefined;
+    return {};
   }
 
   const [attached, args] = handleRunAttachments(
@@ -375,6 +423,58 @@ const convertSerializableArg = (arg: unknown): unknown => {
   return arg;
 };
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type TraceableConfig<Func extends (...args: any[]) => any> = Partial<
+  Omit<RunTreeConfig, "inputs" | "outputs">
+> & {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  aggregator?: (args: any[]) => any;
+  argsConfigPath?: [number] | [number, string];
+  tracer?: OTELTracer;
+  __finalTracedIteratorKey?: string;
+
+  /**
+   * Extract attachments from args and return remaining args.
+   * @param args Arguments of the traced function
+   * @returns Tuple of [Attachments, remaining args]
+   */
+  extractAttachments?: (
+    ...args: Parameters<Func>
+  ) => [Attachments | undefined, KVMap];
+
+  /**
+   * Extract invocation parameters from the arguments of the traced function.
+   * This is useful for LangSmith to properly track common metadata like
+   * provider, model name and temperature.
+   *
+   * @param args Arguments of the traced function
+   * @returns Key-value map of the invocation parameters, which will be merged with the existing metadata
+   */
+  getInvocationParams?: (
+    ...args: Parameters<Func>
+  ) => InvocationParamsSchema | undefined;
+
+  /**
+   * Apply transformations to the inputs before logging.
+   * This function should NOT mutate the inputs.
+   * `processInputs` is not inherited by nested traceable functions.
+   *
+   * @param inputs Key-value map of the function inputs.
+   * @returns Transformed key-value map
+   */
+  processInputs?: (inputs: Readonly<KVMap>) => KVMap;
+
+  /**
+   * Apply transformations to the outputs before logging.
+   * This function should NOT mutate the outputs.
+   * `processOutputs` is not inherited by nested traceable functions.
+   *
+   * @param outputs Key-value map of the function outputs
+   * @returns Transformed key-value map
+   */
+  processOutputs?: (outputs: Readonly<KVMap>) => KVMap;
+};
+
 /**
  * Higher-order function that takes function as input and returns a
  * "TraceableFunction" - a wrapped version of the input that
@@ -392,53 +492,7 @@ const convertSerializableArg = (arg: unknown): unknown => {
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export function traceable<Func extends (...args: any[]) => any>(
   wrappedFunc: Func,
-  config?: Partial<Omit<RunTreeConfig, "inputs" | "outputs">> & {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    aggregator?: (args: any[]) => any;
-    argsConfigPath?: [number] | [number, string];
-    __finalTracedIteratorKey?: string;
-
-    /**
-     * Extract attachments from args and return remaining args.
-     * @param args Arguments of the traced function
-     * @returns Tuple of [Attachments, remaining args]
-     */
-    extractAttachments?: (
-      ...args: Parameters<Func>
-    ) => [Attachments | undefined, KVMap];
-
-    /**
-     * Extract invocation parameters from the arguments of the traced function.
-     * This is useful for LangSmith to properly track common metadata like
-     * provider, model name and temperature.
-     *
-     * @param args Arguments of the traced function
-     * @returns Key-value map of the invocation parameters, which will be merged with the existing metadata
-     */
-    getInvocationParams?: (
-      ...args: Parameters<Func>
-    ) => InvocationParamsSchema | undefined;
-
-    /**
-     * Apply transformations to the inputs before logging.
-     * This function should NOT mutate the inputs.
-     * `processInputs` is not inherited by nested traceable functions.
-     *
-     * @param inputs Key-value map of the function inputs.
-     * @returns Transformed key-value map
-     */
-    processInputs?: (inputs: Readonly<KVMap>) => KVMap;
-
-    /**
-     * Apply transformations to the outputs before logging.
-     * This function should NOT mutate the outputs.
-     * `processOutputs` is not inherited by nested traceable functions.
-     *
-     * @param outputs Key-value map of the function outputs
-     * @returns Transformed key-value map
-     */
-    processOutputs?: (outputs: Readonly<KVMap>) => KVMap;
-  }
+  config?: TraceableConfig<Func>
 ) {
   type Inputs = Parameters<Func>;
   const {
@@ -518,7 +572,10 @@ export function traceable<Func extends (...args: any[]) => any>(
       processedArgs[i] = convertSerializableArg(processedArgs[i]);
     }
 
-    const [currentRunTree, rawInputs] = ((): [RunTree | undefined, Inputs] => {
+    const [currentContext, rawInputs] = ((): [
+      RunTree | ContextPlaceholder,
+      Inputs
+    ] => {
       const [firstArg, ...restArgs] = processedArgs;
 
       // used for handoff between LangChain.JS and traceable functions
@@ -564,17 +621,29 @@ export function traceable<Func extends (...args: any[]) => any>(
       // Node.JS uses AsyncLocalStorage (ALS) and AsyncResource
       // to allow storing context
       const prevRunFromStore = asyncLocalStorage.getStore();
+      let lc_contextVars;
+      // If a context var is set by LangChain outside of a traceable,
+      // it will be an object with a single property and we should copy
+      // context vars over into the new run tree.
+      if (
+        prevRunFromStore !== undefined &&
+        _LC_CONTEXT_VARIABLES_KEY in prevRunFromStore
+      ) {
+        lc_contextVars = prevRunFromStore[_LC_CONTEXT_VARIABLES_KEY];
+      }
       if (isRunTree(prevRunFromStore)) {
-        return [
-          getTracingRunTree(
-            prevRunFromStore.createChild(ensuredConfig),
-            processedArgs,
-            config?.getInvocationParams,
-            processInputsFn,
-            extractAttachmentsFn
-          ),
-          processedArgs as Inputs,
-        ];
+        const currentRunTree = getTracingRunTree(
+          prevRunFromStore.createChild(ensuredConfig),
+          processedArgs,
+          config?.getInvocationParams,
+          processInputsFn,
+          extractAttachmentsFn
+        );
+        if (lc_contextVars) {
+          ((currentRunTree ?? {}) as any)[_LC_CONTEXT_VARIABLES_KEY] =
+            lc_contextVars;
+        }
+        return [currentRunTree, processedArgs as Inputs];
       }
 
       const currentRunTree = getTracingRunTree(
@@ -584,21 +653,24 @@ export function traceable<Func extends (...args: any[]) => any>(
         processInputsFn,
         extractAttachmentsFn
       );
-      // If a context var is set by LangChain outside of a traceable,
-      // it will be an object with a single property and we should copy
-      // context vars over into the new run tree.
-      if (
-        prevRunFromStore !== undefined &&
-        _LC_CONTEXT_VARIABLES_KEY in prevRunFromStore
-      ) {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        (currentRunTree as any)[_LC_CONTEXT_VARIABLES_KEY] =
-          prevRunFromStore[_LC_CONTEXT_VARIABLES_KEY];
+      if (lc_contextVars) {
+        ((currentRunTree ?? {}) as any)[_LC_CONTEXT_VARIABLES_KEY] =
+          lc_contextVars;
       }
       return [currentRunTree, processedArgs as Inputs];
     })();
 
-    return asyncLocalStorage.run(currentRunTree, () => {
+    const currentRunTree = isRunTree(currentContext)
+      ? currentContext
+      : undefined;
+
+    const otelContextManager = maybeCreateOtelContext(
+      currentRunTree,
+      config?.tracer
+    );
+    const otel_context = getOTELContext();
+
+    const runWithContext = () => {
       const postRunPromise = currentRunTree?.postRun();
 
       async function handleChunks(chunks: unknown[]) {
@@ -620,14 +692,17 @@ export function traceable<Func extends (...args: any[]) => any>(
         const reader = stream.getReader();
         let finished = false;
         const chunks: unknown[] = [];
+        const capturedOtelContext = otel_context.active();
 
         const tappedStream = new ReadableStream({
           async start(controller) {
             // eslint-disable-next-line no-constant-condition
             while (true) {
               const result = await (snapshot
-                ? snapshot(() => reader.read())
-                : reader.read());
+                ? snapshot(() =>
+                    otel_context.with(capturedOtelContext, () => reader.read())
+                  )
+                : otel_context.with(capturedOtelContext, () => reader.read()));
               if (result.done) {
                 finished = true;
                 const processedOutputs = handleRunOutputs({
@@ -673,11 +748,14 @@ export function traceable<Func extends (...args: any[]) => any>(
       ) {
         let finished = false;
         const chunks: unknown[] = [];
+        const capturedOtelContext = otel_context.active();
         try {
           while (true) {
             const { value, done } = await (snapshot
-              ? snapshot(() => iterator.next())
-              : iterator.next());
+              ? snapshot(() =>
+                  otel_context.with(capturedOtelContext, () => iterator.next())
+                )
+              : otel_context.with(capturedOtelContext, () => iterator.next()));
             if (done) {
               finished = true;
               break;
@@ -875,7 +953,16 @@ export function traceable<Func extends (...args: any[]) => any>(
           return Reflect.get(target, prop, receiver);
         },
       });
-    });
+    };
+
+    // Wrap with OTEL context if available, similar to Python's implementation
+    if (otelContextManager) {
+      return asyncLocalStorage.run(currentContext, () =>
+        otelContextManager(runWithContext)
+      );
+    } else {
+      return asyncLocalStorage.run(currentContext, runWithContext);
+    }
   };
 
   Object.defineProperty(traceableFunc, "langsmith:traceable", {
